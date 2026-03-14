@@ -1,35 +1,29 @@
 import aiohttp
 import asyncio
-import csv
 import json
 import time
 from bs4 import BeautifulSoup
 from urllib.parse import quote
-import sys
 
-# 官方 CSV API
-CSV_URL = "https://www.vpngate.net/api/export/"
+# VPN Gate 主页（服务器列表页）
+MAIN_URL = "https://www.vpngate.net/en/"
 
-async def fetch_text(session, url, encodings=('utf-8', 'shift_jis', 'iso-8859-1')):
-    """尝试用多种编码获取响应文本"""
-    async with session.get(url) as resp:
-        raw = await resp.read()
-        for enc in encodings:
-            try:
-                text = raw.decode(enc)
-                return text, enc
-            except UnicodeDecodeError:
-                continue
-        return raw.decode('utf-8', errors='ignore'), 'utf-8(ignore)'
+async def fetch_html(session, url, headers=None):
+    """获取 HTML 内容"""
+    if headers is None:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    async with session.get(url, headers=headers) as resp:
+        if resp.status != 200:
+            raise Exception(f"HTTP {resp.status}")
+        return await resp.text()
 
 async def fetch_protocols(session, hostname, semaphore):
     """获取单个服务器的协议支持列表"""
     url = f"https://www.vpngate.net/en/entry.aspx?hostname={quote(hostname)}"
     async with semaphore:
         try:
-            text, enc = await fetch_text(session, url)
-            soup = BeautifulSoup(text, 'html.parser')
-            # 查找协议部分，通常在一个包含 "Supported VPN Protocols" 的标题附近
+            html = await fetch_html(session, url)
+            soup = BeautifulSoup(html, 'html.parser')
             protocols_section = soup.find('h3', string=lambda t: t and 'Supported VPN Protocols' in t)
             if protocols_section:
                 next_elem = protocols_section.find_next()
@@ -43,58 +37,58 @@ async def fetch_protocols(session, hostname, semaphore):
 
 async def main():
     start_time = time.time()
-    print("正在从官方 API 获取基础列表...")
+    print("正在从 VPN Gate 主页获取服务器列表...")
     async with aiohttp.ClientSession() as session:
-        csv_text, csv_enc = await fetch_text(session, CSV_URL)
-        print(f"CSV 解码编码: {csv_enc}")
-        # 打印前 200 个字符用于调试
-        print("CSV 前200字符:", repr(csv_text[:200]))
+        html = await fetch_html(session, MAIN_URL)
+        soup = BeautifulSoup(html, 'html.parser')
 
-        lines = csv_text.strip().split('\n')
-        print(f"总行数: {len(lines)}")
-        if len(lines) < 3:
-            print("警告：数据行数不足，可能 API 返回错误内容")
+        # 找到服务器表格 (id="vg_table")
+        table = soup.find('table', {'id': 'vg_table'})
+        if not table:
+            print("未找到服务器表格，可能页面结构已变")
             return
 
-        # 找到真正的数据开始行（跳过所有以 # 或 * 开头的注释行）
-        data_start = 0
-        for i, line in enumerate(lines):
-            if line and not line.startswith('#') and not line.startswith('*'):
-                data_start = i
-                break
-        print(f"数据从第 {data_start+1} 行开始")
-
-        # 使用 csv.reader 解析数据部分
-        reader = csv.reader(lines[data_start:])
+        rows = table.find('tbody').find_all('tr')
         servers = []
-        row_count = 0
-        for row in reader:
-            row_count += 1
-            if len(row) < 15:
-                print(f"跳过行 {row_count} (字段数 {len(row)}): {row}")
+        for row in rows:
+            cols = row.find_all('td')
+            if len(cols) < 8:  # 至少需要前几个字段
                 continue
-            hostname = row[0].strip('"')
-            ip = row[1].strip('"')
-            country = row[5].strip('"')
-            ping = row[3].strip('"')
-            speed = row[4].strip('"')
-            score = row[2].strip('"')
+
+            # 提取数据（根据实际表格结构调整）
+            # 通常顺序：HostName, IP, Score, Ping, Speed, Country, ...
+            hostname = cols[0].get_text(strip=True)
+            ip = cols[1].get_text(strip=True)
+            score = cols[2].get_text(strip=True)
+            ping = cols[3].get_text(strip=True)
+            speed = cols[4].get_text(strip=True)
+            country = cols[5].get_text(strip=True)
+
+            # 清理数字字段（可能包含逗号或单位）
+            def clean_num(s):
+                s = s.replace(',', '').replace('Mbps', '').replace('ms', '').strip()
+                try:
+                    return int(s) if s.isdigit() else 0
+                except:
+                    return 0
+
             servers.append({
                 "hostname": hostname,
                 "ip": ip,
                 "country": country,
-                "ping": int(ping) if ping.isdigit() else 999,
-                "speed": int(speed) if speed.isdigit() else 0,
-                "score": int(score) if score.isdigit() else 0,
+                "ping": clean_num(ping),
+                "speed": clean_num(speed),
+                "score": clean_num(score),
             })
-        print(f"解析到 {len(servers)} 个有效服务器")
+
+        print(f"从主页解析到 {len(servers)} 个服务器")
 
     if not servers:
         print("没有获取到任何服务器，终止运行")
         return
 
     print(f"开始并发爬取 {len(servers)} 个服务器的详情页...")
-    semaphore = asyncio.Semaphore(5)  # 并发数 5
+    semaphore = asyncio.Semaphore(5)
     async with aiohttp.ClientSession() as session:
         tasks = []
         for s in servers:
@@ -104,17 +98,16 @@ async def main():
     for i, proto in enumerate(results):
         servers[i]["l2tp"] = proto["l2tp"]
 
-    # 筛选支持 L2TP 的服务器
     l2tp_servers = [s for s in servers if s.get("l2tp")]
     l2tp_servers.sort(key=lambda x: x["country"])
 
     print(f"支持 L2TP 的服务器: {len(l2tp_servers)} 个")
 
-    # 写入 JSON 文件（确保文件名正确）
+    # 写入 JSON
     with open("l2tp-servers.json", "w", encoding="utf-8") as f:
         json.dump(l2tp_servers, f, ensure_ascii=False, indent=2)
 
-    # 生成 Markdown 表格
+    # 生成 Markdown
     with open("l2tp-servers.md", "w", encoding="utf-8") as f:
         f.write("# 🌍 L2TP/IPsec Servers (实时更新)\n\n")
         f.write("更新时间: {}\n\n".format(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
